@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,11 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/improbable-eng/thanos/pkg/objstore"
+
+	"github.com/go-kit/kit/log/level"
+	"github.com/improbable-eng/thanos/pkg/shipper"
 
 	"github.com/prometheus/tsdb/labels"
 
@@ -46,18 +52,84 @@ var (
 )
 
 func registerBucket(m map[string]setupFunc, app *kingpin.Application, name string) {
-	cmd := app.Command(name, "Inspect metric data in an object storage bucket")
+	cmd := app.Command(name, "Bucket utility commands")
 
-	objStoreConfig := regCommonObjStoreFlags(cmd, "")
-	objStoreBackupConfig := regCommonObjStoreFlags(cmd, "-backup")
+	objStoreConfig := regCommonObjStoreFlags(cmd, "", true)
 
-	// Verify command.
-	verify := cmd.Command("verify", "Verify all blocks in the bucket against specified issues")
-	verifyRepair := verify.Flag("repair", "Attempt to repair blocks for which issues were detected").
+	registerBucketSync(m, cmd, name, objStoreConfig)
+	registerBucketVerify(m, cmd, name, objStoreConfig)
+	registerBucketLs(m, cmd, name, objStoreConfig)
+	registerBucketInspect(m, cmd, name, objStoreConfig)
+	return
+}
+
+func registerBucketSync(m map[string]setupFunc, root *kingpin.CmdClause, name string, objStoreConfig *pathOrContent) {
+	cmd := root.Command("sync", "Synchronise all blocks with remote bucket. NOTE: NO compactor must be running in the same time.")
+	promURL := cmd.Flag("prometheus.url", "URL at which to reach Prometheus's API. For better performance use local network.").
+		Default("http://localhost:9090").URL()
+	labelStrs := cmd.Flag("label", "Optional external labels that will be used for synced blocks. If no label is specified, prometheus.url flag will be used to fetch labels from running Prometheus. (repeated). Similar to external labels for Prometheus, used to identify ruler and its blocks as unique source.").
+		PlaceHolder("<name>=\"<value>\"").Strings()
+	dataDir := cmd.Flag("data-dir", "Data to sync local blocks from. Usually directory of Prometheus TSDB.").
+		Default("./").String()
+
+	m[name+" sync"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
+		ctx := context.Background()
+		lset, err := parseFlagLabels(*labelStrs)
+		if err != nil {
+			return errors.Wrap(err, "parse labels")
+		}
+
+		bucketConfig, err := objStoreConfig.Content()
+		if err != nil {
+			return err
+		}
+
+		bkt, err := client.NewBucket(logger, bucketConfig, reg, name)
+		if err != nil {
+			return err
+		}
+
+		if len(lset) == 0 {
+			level.Info(logger).Log("msg", "--labels are not specified; querying Prometheus config API to get external labels.", "addr", *promURL)
+			lset, err = queryExternalLabels(ctx, logger, *promURL)
+			if err != nil {
+				return errors.Wrapf(err, "get external labels from Prometheus on %s", *promURL)
+			}
+		}
+
+		if len(lset) == 0 {
+			level.Error(logger).Log("msg", "syncing blocks without external labels is not allowed. Set unique external labels in your Prometheus config or pass explicit external labels via --labels flag.")
+		}
+
+		level.Info(logger).Log("msg", "starting syncing blocks", "dataDir", *dataDir, "extLset", lset)
+		level.Warn(logger).Log("msg", "have you turned off compactor and/or Prometheus? Currently it is unsafe to run compactor in the same time as this command! (y/N)")
+		reader := bufio.NewReader(os.Stdin)
+		text, _ := reader.ReadString('\n')
+		if text != "y\n" {
+			return errors.New("aborting")
+		}
+
+		lsetFn := func() labels.Labels { return lset }
+		uploaded, err := shipper.SyncAll(ctx, logger, *dataDir, bkt, lsetFn, block.BucketSyncSource)
+		if err != nil {
+			if uploaded > 0 {
+				level.Warn(logger).Log("msg", "synced only some blocks", "uploaded", uploaded)
+			}
+			return err
+		}
+		level.Info(logger).Log("msg", "synced all blocks", "uploaded", uploaded)
+		return nil
+	}
+}
+
+func registerBucketVerify(m map[string]setupFunc, root *kingpin.CmdClause, name string, objStoreConfig *pathOrContent) {
+	cmd := root.Command("verify", "Verify all blocks in the bucket against specified issues")
+	objStoreBackupConfig := regCommonObjStoreFlags(cmd, "-backup", false)
+	repair := cmd.Flag("repair", "Attempt to repair blocks for which issues were detected").
 		Short('r').Default("false").Bool()
-	verifyIssues := verify.Flag("issues", fmt.Sprintf("Issues to verify (and optionally repair). Possible values: %v", allIssues())).
+	issuesToVerify := cmd.Flag("issues", fmt.Sprintf("Issues to verify (and optionally repair). Possible values: %v", allIssues())).
 		Short('i').Default(verifier.IndexIssueID, verifier.OverlappedBlocksIssueID).Strings()
-	verifyIDWhitelist := verify.Flag("id-whitelist", "Block IDs to verify (and optionally repair) only. "+
+	idWhitelist := cmd.Flag("id-whitelist", "Block IDs to verify (and optionally repair) only. "+
 		"If none is specified, all blocks will be verified. Repeated field").Strings()
 	m[name+" verify"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
 		bucketConfig, err := objStoreConfig.Content()
@@ -76,14 +148,17 @@ func registerBucket(m map[string]setupFunc, app *kingpin.Application, name strin
 			return err
 		}
 
-		backupBkt, err := client.NewBucket(logger, backupBucketConfig, reg, name)
-		if err == client.ErrNotFound {
-			if *verifyRepair {
+		var backupBkt objstore.Bucket
+		if len(backupBucketConfig) == 0 {
+			if *repair {
 				return errors.Wrap(err, "repair is specified, so backup client is required")
 			}
-		} else if err != nil {
-			return err
 		} else {
+			backupBkt, err = client.NewBucket(logger, backupBucketConfig, reg, name)
+			if err != nil {
+				return err
+			}
+
 			defer runutil.CloseWithLogOnErr(logger, backupBkt, "backup bucket client")
 		}
 
@@ -96,7 +171,7 @@ func registerBucket(m map[string]setupFunc, app *kingpin.Application, name strin
 			issues []verifier.Issue
 		)
 
-		for _, i := range *verifyIssues {
+		for _, i := range *issuesToVerify {
 			issueFn, ok := issuesMap[i]
 			if !ok {
 				return errors.Errorf("no such issue name %s", i)
@@ -104,16 +179,16 @@ func registerBucket(m map[string]setupFunc, app *kingpin.Application, name strin
 			issues = append(issues, issueFn)
 		}
 
-		if *verifyRepair {
+		if *repair {
 			v = verifier.NewWithRepair(logger, bkt, backupBkt, issues)
 		} else {
 			v = verifier.New(logger, bkt, issues)
 		}
 
 		var idMatcher func(ulid.ULID) bool = nil
-		if len(*verifyIDWhitelist) > 0 {
+		if len(*idWhitelist) > 0 {
 			whilelistIDs := map[string]struct{}{}
-			for _, bid := range *verifyIDWhitelist {
+			for _, bid := range *idWhitelist {
 				id, err := ulid.Parse(bid)
 				if err != nil {
 					return errors.Wrap(err, "invalid ULID found in --id-whitelist flag")
@@ -131,9 +206,11 @@ func registerBucket(m map[string]setupFunc, app *kingpin.Application, name strin
 
 		return v.Verify(ctx, idMatcher)
 	}
+}
 
-	ls := cmd.Command("ls", "List all blocks in the bucket")
-	lsOutput := ls.Flag("output", "Format in which to print each block's information. May be 'json' or custom template.").
+func registerBucketLs(m map[string]setupFunc, root *kingpin.CmdClause, name string, objStoreConfig *pathOrContent) {
+	cmd := root.Command("ls", "List all blocks in the bucket")
+	output := cmd.Flag("output", "Format in which to print each block's information. May be 'json' or custom template.").
 		Short('o').Default("").String()
 	m[name+" ls"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
 		bucketConfig, err := objStoreConfig.Content()
@@ -155,7 +232,7 @@ func registerBucket(m map[string]setupFunc, app *kingpin.Application, name strin
 		defer cancel()
 
 		var (
-			format     = *lsOutput
+			format     = *output
 			printBlock func(id ulid.ULID) error
 		)
 
@@ -220,11 +297,13 @@ func registerBucket(m map[string]setupFunc, app *kingpin.Application, name strin
 			return printBlock(id)
 		})
 	}
+}
 
-	inspect := cmd.Command("inspect", "Inspect all blocks in the bucket")
-	selector := inspect.Flag("selector", "Selects blocks based on label, e.g. '-l key1=\"value1\" -l key2=\"value2\"'. All key value pairs must match.").Short('l').
+func registerBucketInspect(m map[string]setupFunc, root *kingpin.CmdClause, name string, objStoreConfig *pathOrContent) {
+	cmd := root.Command("inspect", "Inspect all blocks in the bucket")
+	selector := cmd.Flag("selector", "Selects blocks based on label, e.g. '-l key1=\"value1\" -l key2=\"value2\"'. All key value pairs must match.").Short('l').
 		PlaceHolder("<name>=\"<value>\"").Strings()
-	sortBy := inspect.Flag("sort-by", "Sort by columns. It's also possible to sort by multiple columns, e.g. '--sort-by FROM --sort-by UNTIL'. I.e., if the 'FROM' value is equal the rows are then further sorted by the 'UNTIL' value.").
+	sortBy := cmd.Flag("sort-by", "Sort by columns. It's also possible to sort by multiple columns, e.g. '--sort-by FROM --sort-by UNTIL'. I.e., if the 'FROM' value is equal the rows are then further sorted by the 'UNTIL' value.").
 		Default("FROM", "UNTIL").Enums(inspectColumns...)
 
 	m[name+" inspect"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
